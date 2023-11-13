@@ -9,11 +9,19 @@ import Cocoa
 
 @main
 class AppDelegate: NSObject, NSApplicationDelegate {
-
-
+    var welcomeWindowController : NSWindowController? = {
+        let storyboard = NSStoryboard(name: NSStoryboard.Name("Main"), bundle: nil)
+        return storyboard.instantiateController(withIdentifier: NSStoryboard.SceneIdentifier("welcome-window-controller")) as? NSWindowController
+    }()
 
     func applicationDidFinishLaunching(_ aNotification: Notification) {
-        // Insert code here to initialize your application
+        
+    }
+    
+    func applicationDidBecomeActive(_ notification: Notification) {
+        if NSDocumentController.shared.documents.isEmpty {
+            showWelcome()
+        }
     }
 
     func applicationWillTerminate(_ aNotification: Notification) {
@@ -23,7 +31,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationSupportsSecureRestorableState(_ app: NSApplication) -> Bool {
         return true
     }
-
-
+    
+    func applicationShouldOpenUntitledFile(_ sender: NSApplication) -> Bool {
+        return false;
+    }
+    
+    func showWelcome() {
+        self.welcomeWindowController?.showWindow(self)
+    }
 }
 

@@ -6,6 +6,19 @@
 //
 
 import Foundation
+import Combine
+
+typealias LineProcesor = (String) -> LinkMapLineResult
+public typealias ProgressHandler = (Int, Int) -> Void
+
+enum LinkMapLineResult {
+    case none
+    case meta
+    case mark(LineProcesor)
+    case object(LinkMapObject)
+    case section(SectionObject)
+    case symbol(SymbolObject)
+}
 
 public class LinkMapObject {
     init(_ index : UInt32, _ path: String) {
@@ -65,11 +78,22 @@ public struct LinkMap {
     public var symbols : [SymbolObject] = []
 }
 
-public class LinkMapParser {
-    public var linkmaps : [LinkMap] = []
+public enum LinkMapParserError : Error {
+    case unknown
+    case openFailed
+    case parseFailed
+    case canceled
+}
+
+public actor LinkMapParser {
+    static let ProgressReportIntervalInBytes = 1024
     var currentFile : LinkMap? = nil
-    var lineProcessor : ((String) -> Void)? = nil
+    var task : Task<(), Never>?
     
+    public func cancel() {
+        self.task?.cancel()
+        self.currentFile = nil
+    }
     
     static func hexToUInt32(_ hex: Substring) -> UInt32 {
         let literal = hex.hasPrefix("0x") ? String(hex.dropFirst(2)) : String(hex)
@@ -96,9 +120,9 @@ public class LinkMapParser {
         return nil
     }
     
-    public static func parseObjectLine(line: String) -> LinkMapObject? {
+    private static func parseObjectLine(line: String) -> LinkMapObject? {
         let pattern = #"^\[[ \t]*(\d+)\][ \t]+(.*)$"#
-        return parseByRegex(line: line, pattern: pattern) { match in
+        return  parseByRegex(line: line, pattern: pattern) { match in
             let idx  = line[Range(match.range(at: 1), in: line)!]
             let path = line[Range(match.range(at: 2), in: line)!]
             
@@ -106,7 +130,7 @@ public class LinkMapParser {
         }
     }
 
-    public static func parseSectionLine(line: String) -> SectionObject? {
+    private static func parseSectionLine(line: String) -> SectionObject? {
         let pattern = #"^(0x[0-9A-F]+)[ \t]+(0x[0-9A-F]+)[ \t]+([^ \t]+)[ \t]+([^ \t]+)$"#
         return parseByRegex(line: line, pattern: pattern) { match in
             let addr    = line[Range(match.range(at: 1), in: line)!]
@@ -120,7 +144,7 @@ public class LinkMapParser {
         }
     }
     
-    public static func parseSymbolLine(line: String) -> SymbolObject? {
+    private static func parseSymbolLine(line: String) -> SymbolObject? {
         let pattern = #"^(0x[0-9A-F]+)+[ \t]+(0x[0-9A-F]+)+[ \t]+\[[ \t+]*(\d+)\][ \t]+(.*)$"#
         return parseByRegex(line: line, pattern: pattern) { match in
             let addr = line[Range(match.range(at: 1), in: line)!]
@@ -139,9 +163,13 @@ public class LinkMapParser {
     public init() {
     }
     
-    private func processLine(_ data : Data) {
-        guard let line = String(data: data, encoding: .utf8) else {
-            return;
+    private func processLine(_ data : Data, lineProcessor:LineProcesor?) -> LinkMapLineResult {
+        var line = String(data: data, encoding: .utf8)
+        if line == nil {
+            line = String(data: data, encoding: .ascii)
+        }
+        guard let line = line else {
+            return .none;
         }
         
         let pathPrefix = "# Path: "
@@ -151,68 +179,98 @@ public class LinkMapParser {
         let symbolsPrefix = "# Symbols:"
         
         if line.hasPrefix(pathPrefix) {
-            if let file = currentFile {
-                linkmaps.append(file)
-            }
             let start = line.index(line.startIndex, offsetBy: pathPrefix.count)
             self.currentFile = LinkMap(path: String(line[start...]))
+            return .meta
         } else if line.hasPrefix(archPrefix) {
             let start = line.index(line.startIndex, offsetBy: archPrefix.count)
             self.currentFile?.arch = String(line[start...])
+            return .meta
         } else if line.hasPrefix(objectFilesPrefix) {
 //            print("start objects")
-            self.lineProcessor = { line in
+            return .mark({ line in
                 if let object = LinkMapParser.parseObjectLine(line: line) {
                     self.currentFile?.objects.append(object)
+                    return .object(object)
                 }
-            }
+                return .none
+            })
         } else if line.hasPrefix(sectionPrefix) {
 //            print("start section")
-            self.lineProcessor = { line in
+            return .mark({ line in
                 if let object = LinkMapParser.parseSectionLine(line: line) {
                     self.currentFile?.sections.append(object)
+                    return .section(object)
                 } else {
 //                    print("error parse line: \(line)")
                 }
-            }
+                return .none
+            })
         } else if line.hasPrefix(symbolsPrefix) {
             print("start symbols")
-            self.lineProcessor = { line in
+            return .mark { line in
                 if let object = LinkMapParser.parseSymbolLine(line: line) {
                     self.currentFile?.symbols.append(object)
 //                    print(line)
+                    return .symbol(object)
                 }
+                return .none
             }
+           
         } else if line.hasPrefix("#") {
             // skip
+            return .none
         } else {
-            self.lineProcessor?(line)
+            return lineProcessor?(line) ?? .none
         }
     }
     
-    public func parseData(data : Data) {
+    public func parseData(data : Data, progressHandler: @escaping ProgressHandler ) async -> Result<LinkMap, LinkMapParserError> {
         var lineStart : Int = 0
+        
+        var lastUpdate = CFAbsoluteTimeGetCurrent()
+        var lineProcessor : LineProcesor? = nil
+        
         for i in 0..<data.count {
+            if Task.isCancelled {
+                return Result.failure(LinkMapParserError.canceled)
+            }
             let ch = data[i]
             if ch == UInt8(ascii: "\n") {
                 if (i > lineStart) {
-                    processLine(data[lineStart..<i])
+                    autoreleasepool {
+                        if case let .mark(processor) = self.processLine(data[lineStart..<i], lineProcessor: lineProcessor) {
+                            lineProcessor = processor
+                        }
+                    }
                 }
                 lineStart = i+1
             }
+            if i % Self.ProgressReportIntervalInBytes == 0 {
+                let now = CFAbsoluteTimeGetCurrent()
+                if now - lastUpdate > 0.3 {
+                    lastUpdate = now
+                    progressHandler(i, data.count)
+                }
+            }
         }
         if (lineStart < data.count) {
-            processLine(data[lineStart..<data.count])
+            _ = self.processLine(data[lineStart..<data.count], lineProcessor: lineProcessor)
         }
-        if let file = currentFile {
-            linkmaps.append(file)
+        progressHandler(data.count, data.count)
+       
+        if let file = self.currentFile {
+            return Result.success(file)
+        } else {
+            return  Result.failure(LinkMapParserError.parseFailed)
         }
     }
     
-    public func parseFile(path : String) {
+    public func parseFile(path : String, progressHandler: @escaping ProgressHandler)async -> Result<LinkMap, LinkMapParserError> {
         guard let data = try? Data(contentsOf: URL(fileURLWithPath: path), options: .alwaysMapped) else {
-            return
+            return Result.failure(LinkMapParserError.openFailed)
         }
-        parseData(data: data)
+        
+        return await parseData(data: data, progressHandler: progressHandler)
     }
 }

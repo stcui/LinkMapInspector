@@ -7,6 +7,7 @@
 
 import Cocoa
 import Dispatch
+import Combine
 
 let kSuggestionLabel = "label"
 
@@ -16,7 +17,9 @@ class ViewController: NSViewController, NSSearchFieldDelegate {
     @IBOutlet var treeController : NSTreeController!
     @objc dynamic var nodes : [Node] = []
     @IBOutlet weak var searchBar: NSSearchField!
+    @IBOutlet weak var progressIndicator: NSProgressIndicator!
     
+    var observer : [AnyCancellable] = []
     var keywords:[String] = []
 
     
@@ -29,12 +32,37 @@ class ViewController: NSViewController, NSSearchFieldDelegate {
     }
     
     func updateByDocument() {
+        observer.forEach{$0.cancel()}
+        observer.removeAll()
+        
         guard let object = self.representedObject as? Document else {
+            self.nodes = []
             return
         }
-        if let linkMap = object.linkMap {
-            updateByObject(linkMap)
-        }
+        self.textField.stringValue = "Loading..."
+        self.observer.append(object.$linkmap
+            .sink { [weak self] linkmap in
+                guard let self = self else { return }
+                DispatchQueue.main.async {
+                    if linkmap != nil {
+                        self.updateByObject(linkmap!)
+                    }
+                }
+            })
+        self.observer.append(object.$state.sink { [weak self] state in
+            guard let self = self else { return }
+            DispatchQueue.main.async {
+                switch state {
+                case .idle:
+                    self.textField.stringValue = "Not loaded"
+                case .loading:
+                    self.textField.stringValue = "Loading"
+                case .loaded:
+                    self.progressIndicator.isHidden = true
+                    break;
+                }
+            }
+        })
     }
     
     func updateByObject(_ linkMap : LinkMap) {
@@ -54,6 +82,7 @@ class ViewController: NSViewController, NSSearchFieldDelegate {
         self.textField.stringValue = """
         \(linkMap.objects.count) objects \(linkMap.sections.count) sections \(linkMap.symbols.count) symbols \(nodes.count) libs
         """
+        self.treeController.rearrangeObjects()
     }
     
     override var representedObject: Any? {
